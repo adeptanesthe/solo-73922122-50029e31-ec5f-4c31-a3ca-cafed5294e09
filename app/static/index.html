@@ -36,10 +36,12 @@
   .verdict.pass { background: #dcfce7; color: #166534; }
   .verdict.fail { background: #fee2e2; color: #991b1b; }
   .verdict.no_data { background: #f3f4f6; color: #4b5563; }
+  .verdict.invalid { background: #fef3c7; color: #92400e; }
   .tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
   .tag.included { background: #dcfce7; color: #166534; }
   .tag.excluded_uncovered { background: #fef9c3; color: #854d0e; }
   .tag.excluded_insufficient { background: #ffedd5; color: #9a3412; }
+  .tag.needs_reevaluation { background: #fef3c7; color: #92400e; }
   .hint { font-size: 12px; color: #6b7280; line-height: 1.7; }
   code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .hidden { display: none; }
@@ -73,6 +75,7 @@
     <code>propensity</code> 为旧策略倾向分数（0~1）；<code>new_rank</code> 为该物品在新策略候选排序中的位次（从 1 开始，留空表示未被新策略推荐）。
     若新策略推荐了某物品但日志中没有曝光，可写一行 <code>event_no</code> 留空、仅填 <code>session_id,item_id,new_rank</code> 的"仅候选行"，用于识别未覆盖候选。
     相同 <code>event_no</code> 只会被处理一次；修改日志后请选择"替换"导入或清空后重新导入，再重新评估。
+    截断上限可以是极小值（如 <code>1e-200</code>）或极大值（如 <code>1e200</code>）；指标用精确分数计算，只有结果本身超出有限浮点数范围时才会提示失败，且不会写入历史记录。
   </p>
   <div class="msg" id="statusLine"></div>
 </section>
@@ -142,16 +145,31 @@ const VERDICT_TEXT = {
   pass: "通过：截断 IPS 估计的新策略点击率不低于旧策略实测点击率",
   fail: "未通过：截断 IPS 估计的新策略点击率低于旧策略实测点击率",
   no_data: "无有效会话：所有会话均因未覆盖或样本不足被排除，无法得出结论",
+  invalid: "需重评：该历史记录含有 NaN/Infinity 等非有限数，无法展示指标",
 };
 const STATUS_TEXT = { included: "纳入", excluded_uncovered: "排除·未覆盖", excluded_insufficient: "排除·样本不足" };
-const fmt = (v) => (v === null || v === undefined) ? "—" : Number(v).toFixed(4);
+const fmt = (v) => {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "非有限数";
+  if (n === 0) return "0";
+  const a = Math.abs(n);
+  if (a < 1e-4 || a >= 1e6) return n.toExponential(4);
+  return n.toFixed(4);
+};
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) {
     let detail = r.statusText;
-    try { detail = (await r.json()).detail || detail; } catch (e) {}
-    throw new Error(detail);
+    try {
+      const body = await r.json();
+      detail = body.detail;
+      if (detail && typeof detail === "object") detail = detail.message || JSON.stringify(detail);
+    } catch (e) {}
+    const err = new Error(detail || r.statusText);
+    err.status = r.status;
+    throw err;
   }
   return r.json();
 }
@@ -199,6 +217,14 @@ async function clearLogs() {
 async function runEval() {
   const cap = parseFloat(document.getElementById("cap").value);
   const minEss = parseFloat(document.getElementById("minEss").value);
+  if (!Number.isFinite(cap) || cap <= 0) {
+    setMsg("evalMsg", "评估失败：截断上限必须是有限正数", false);
+    return;
+  }
+  if (!Number.isFinite(minEss) || minEss < 0) {
+    setMsg("evalMsg", "评估失败：ESS 阈值必须是有限的非负数", false);
+    return;
+  }
   try {
     const r = await api("/api/evaluate", {
       method: "POST",
@@ -208,12 +234,37 @@ async function runEval() {
     renderResult(r);
     setMsg("evalMsg", `评估完成（ID=${r.id}，截断上限=${r.cap}，ESS阈值=${r.min_ess}）`, true);
     loadHistory();
-  } catch (e) { setMsg("evalMsg", "评估失败：" + e.message, false); }
+  } catch (e) {
+    renderEvalError(e.message);
+    setMsg("evalMsg", "评估失败：" + e.message, false);
+  }
+}
+
+function renderEvalError(message) {
+  document.getElementById("resultSection").classList.remove("hidden");
+  const v = document.getElementById("verdict");
+  v.className = "verdict invalid";
+  v.textContent = /^评估失败/.test(message) ? message : "评估失败：" + message;
+  document.getElementById("overallCards").innerHTML = "";
+  document.getElementById("sessionSection").classList.add("hidden");
+  document.getElementById("uncoveredSection").classList.add("hidden");
+  document.getElementById("insufficientSection").classList.add("hidden");
 }
 
 function renderResult(r) {
   document.getElementById("resultSection").classList.remove("hidden");
   const v = document.getElementById("verdict");
+
+  if (r.needs_reevaluation) {
+    v.className = "verdict invalid";
+    v.textContent = "需重评：" + (r.reason || "该记录含有非有限数，无法展示指标");
+    document.getElementById("overallCards").innerHTML = "";
+    document.getElementById("sessionSection").classList.add("hidden");
+    document.getElementById("uncoveredSection").classList.add("hidden");
+    document.getElementById("insufficientSection").classList.add("hidden");
+    return;
+  }
+
   v.className = "verdict " + r.verdict;
   v.textContent = VERDICT_TEXT[r.verdict] || r.verdict;
   const o = r.overall;
@@ -250,14 +301,21 @@ function renderResult(r) {
   } else is.classList.add("hidden");
 }
 
+const VERDICT_TAG_CLASS = {
+  pass: "included",
+  fail: "excluded_insufficient",
+  no_data: "",
+  invalid: "needs_reevaluation",
+};
+
 async function loadHistory() {
   try {
     const list = await api("/api/evaluations");
     document.querySelector("#historyTable tbody").innerHTML = list.map(h => `
       <tr class="hist-item" onclick="loadEval(${h.id})">
-        <td>${h.id}</td><td>${h.created_at}</td><td>${h.cap}</td><td>${h.min_ess}</td>
-        <td>${h.included_sessions}</td><td>${fmt(h.ips_ctr)}</td><td>${fmt(h.snips_ctr)}</td>
-        <td><span class="tag ${h.verdict === "pass" ? "included" : (h.verdict === "fail" ? "excluded_insufficient" : "")}">${VERDICT_TEXT[h.verdict] ? h.verdict : h.verdict}</span></td>
+        <td>${h.id}</td><td>${h.created_at}</td><td>${fmt(h.cap)}</td><td>${fmt(h.min_ess)}</td>
+        <td>${h.included_sessions ?? "—"}</td><td>${fmt(h.ips_ctr)}</td><td>${fmt(h.snips_ctr)}</td>
+        <td><span class="tag ${VERDICT_TAG_CLASS[h.verdict] || ""}">${h.needs_reevaluation ? "需重评" : (VERDICT_TEXT[h.verdict] || h.verdict).split("：")[0]}</span></td>
       </tr>`).join("");
   } catch (e) { /* 忽略 */ }
 }

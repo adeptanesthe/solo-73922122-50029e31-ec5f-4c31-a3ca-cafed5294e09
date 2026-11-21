@@ -1,5 +1,6 @@
 """SQLite 存储层。DB_PATH 可用环境变量覆盖，测试时替换为临时库。"""
 
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -46,6 +47,17 @@ CREATE TABLE IF NOT EXISTS evaluations (
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def has_non_finite(value) -> bool:
+    """递归检查 JSON 兼容结构里是否含有 NaN / Infinity。"""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(has_non_finite(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(has_non_finite(v) for v in value)
+    return False
 
 
 def get_conn() -> sqlite3.Connection:

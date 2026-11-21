@@ -1,8 +1,16 @@
 """指标核心逻辑的单元测试。"""
 
+import math
+
 import pytest
 
-from app.metrics import Exposure, evaluate_dataset, evaluate_session, truncated_weight
+from app.metrics import (
+    Exposure,
+    MetricRangeError,
+    evaluate_dataset,
+    evaluate_session,
+    truncated_weight,
+)
 
 
 def test_truncated_weight_caps_large_values():
@@ -49,6 +57,94 @@ def test_evaluate_session_truncation_applied():
     assert res["sum_w"] == pytest.approx(10.0)
     assert res["ips_ctr"] == pytest.approx(10.0)
     assert res["snips_ctr"] == pytest.approx(1.0)
+
+
+def test_tiny_cap_keeps_ess_and_flags_insufficient_correctly():
+    # 截断上限 1e-200：权重下溢到 1e-200 量级，原先 ESS 会因 w^2 下溢成 0
+    exposures = [
+        Exposure("A", clicked=1, propensity=0.5),
+        Exposure("B", clicked=0, propensity=0.5),
+    ]
+    res = evaluate_session(exposures, {"A": 1, "B": 2}, cap=1e-200)
+    assert res["sum_w"] == pytest.approx(2e-200, rel=1e-9)
+    # ESS = (2e-200)^2 / (2 * 1e-400) = 2.0，按原定义仍达标
+    assert res["ess"] == pytest.approx(2.0, rel=1e-12)
+    assert res["ips_ctr"] == pytest.approx(5e-201, rel=1e-9)
+    assert res["snips_ctr"] == pytest.approx(0.5, rel=1e-12)
+
+    out = evaluate_dataset({"s": {"exposures": exposures, "candidates": {"A": 1, "B": 2}}}, 1e-200, 2.0)
+    assert out["overall"]["included_sessions"] == 1
+    assert out["per_session"][0]["status"] == "included"
+    assert out["verdict"] in ("pass", "fail")
+
+
+def test_huge_cap_ess_is_exact():
+    # 截断上限 1e200：权重上溢到 1e200 量级，原先 w^2 上溢为 inf，ESS 变成 NaN
+    exposures = [
+        Exposure("A", clicked=1, propensity=1e-200),
+        Exposure("B", clicked=0, propensity=1e-200),
+    ]
+    res = evaluate_session(exposures, {"A": 1, "B": 2}, cap=1e200)
+    assert res["sum_w"] == pytest.approx(2e200, rel=1e-9)
+    assert res["ess"] == pytest.approx(2.0, rel=1e-12)
+    assert res["ips_ctr"] == pytest.approx(5e199, rel=1e-9)
+    assert res["snips_ctr"] == pytest.approx(0.5, rel=1e-12)
+    for key in ("sum_w", "ess", "ips_ctr", "snips_ctr", "baseline_ctr"):
+        assert math.isfinite(res[key])
+
+    out = evaluate_dataset({"s": {"exposures": exposures, "candidates": {"A": 1, "B": 2}}}, 1e200, 2.0)
+    assert out["overall"]["included_sessions"] == 1
+    assert math.isfinite(out["overall"]["ips_ctr"])
+    assert out["verdict"] == "pass"
+
+
+def test_huge_cap_low_ess_still_excluded():
+    # 权重差异大时 ESS 依然按定义衡量样本量：1e200 与 1e100 各一个 → ESS≈1
+    exposures = [
+        Exposure("A", clicked=1, propensity=1e-200),
+        Exposure("B", clicked=0, propensity=1e-100),
+    ]
+    res = evaluate_session(exposures, {"A": 1, "B": 2}, cap=1e200)
+    assert res["ess"] == pytest.approx(1.0, rel=1e-12)
+    out = evaluate_dataset({"s": {"exposures": exposures, "candidates": {"A": 1, "B": 2}}}, 1e200, 2.0)
+    assert out["per_session"][0]["status"] == "excluded_insufficient"
+    assert out["verdict"] == "no_data"
+
+
+def test_metric_out_of_float_range_raises():
+    # 会话指标本身超出双精度范围（权重和 2e308）→ 明确抛出 MetricRangeError
+    exposures = [
+        Exposure("A", clicked=1, propensity=1e-308),
+        Exposure("B", clicked=0, propensity=1e-308),
+    ]
+    with pytest.raises(MetricRangeError) as exc:
+        evaluate_session(exposures, {"A": 1, "B": 2}, cap=1e308)
+    assert exc.value.field == "sum_w"
+
+    # 逐会话评估时由 evaluate_dataset 补上会话号
+    sessions = {"s": {"exposures": exposures, "candidates": {"A": 1, "B": 2}}}
+    with pytest.raises(MetricRangeError) as exc2:
+        evaluate_dataset(sessions, cap=1e308, min_ess=0.0)
+    assert exc2.value.session_id == "s"
+
+
+def test_truncated_weight_rejects_non_finite_cap():
+    with pytest.raises(ValueError):
+        truncated_weight(0.5, float("inf"))
+    with pytest.raises(ValueError):
+        truncated_weight(0.5, float("nan"))
+
+
+def test_dataset_average_does_not_overflow_intermediately():
+    # 两个会话各自 IPS≈1e308 量级，两数相加会溢出成 inf，但平均值仍在范围内
+    sessions = {
+        "a": {"exposures": [Exposure("A", 1, 1e-308)], "candidates": {"A": 1}},
+        "b": {"exposures": [Exposure("B", 1, 0.5e-308)], "candidates": {"B": 1}},
+    }
+    res = evaluate_dataset(sessions, cap=1.5e308, min_ess=0.0)
+    assert res["overall"]["included_sessions"] == 2
+    assert math.isfinite(res["overall"]["ips_ctr"])
+    assert res["overall"]["ips_ctr"] == pytest.approx(1.25e308, rel=1e-9)
 
 
 def test_evaluate_dataset_exclusions():

@@ -12,6 +12,7 @@ CSV 列（表头必须包含以下列，顺序不限）：
 
 import csv
 import io
+import math
 
 COLUMNS = ["session_id", "event_no", "item_id", "position", "clicked", "propensity", "new_rank"]
 
@@ -37,10 +38,14 @@ def _parse_int(value, name, lineno, errors, min_v=None, choices=None):
 
 def _parse_float(value, name, lineno, errors):
     try:
-        return float(value)
+        v = float(value)
     except (TypeError, ValueError):
         errors.append(f"第{lineno}行: {name} 必须是数字，得到 '{value}'")
         return None
+    if not math.isfinite(v):
+        errors.append(f"第{lineno}行: {name} 必须是有限数字，得到 '{value}'")
+        return None
+    return v
 
 
 def parse_log_csv(text: str):
